@@ -47,13 +47,16 @@ cd local-gemini-code-review
 cp .env.example .env
 # edit .env: set OPENROUTER_API_KEY=... or GEMINI_API_KEY=... (or both)
 
-# Review the current branch of whatever project you're in:
+# From the runner directory, against the CWD:
+cd /path/to/local-gemini-code-review
+uv run review.py --base origin/main         # iterative review of current branch
+uv run review.py --pr 6                     # review a specific PR
+uv run review.py --codebase                 # whole tracked codebase (filtered)
+uv run review.py --base origin/main --model claude   # use Claude instead of Gemini
+
+# Or invoke from any project directory by pointing at the runner:
 cd /path/to/my-project
 uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-review/review.py
-
-# Or invoke from the runner directory against an external CWD:
-cd /path/to/local-gemini-code-review
-uv run review.py --pr 6
 ```
 
 `uv` resolves deps on first run. No global `pip install` required.
@@ -128,16 +131,18 @@ File selection pipeline:
 4. Apply built-in defensive excludes: lock files, minified output, common binary extensions (`*.png`, `*.svg`, `*.woff`, etc.), `*/dist/*`, `*/build/*`.
 5. Drop individual files larger than 100 KB (logged on stderr — they're usually data fixtures or vendored blobs).
 
-A bundle cap (700 KB ≈ 175 K tokens) is enforced pre-flight; if the bundle is too large the runner exits with the 10 largest files in the current selection so you can target `--exclude` flags effectively rather than paying for a request that would fail mid-flight on the smaller-context models.
+A bundle cap (700,000 chars, ~175 K tokens at the standard 4-chars-per-token estimate) is enforced pre-flight; if the bundle is too large the runner exits with the 10 largest files in the current selection so you can target `--exclude` flags effectively rather than paying for a request that would fail mid-flight on the smaller-context models. The cap is conservative against both Gemini 2.5 Pro (1 M-token context) and Claude Sonnet 4.5 (200 K-token context), so the same selection works regardless of which model you target with `--model`.
 
-Output is the same severity-tagged per-file findings shape as diff mode. The **architectural-summary output shape** (high-level "patterns / structure / smells" section preceding the per-file findings) is an explicit TODO; the trade-offs (hallucination risk on architectural takes, less actionable output, token-budget contention) are documented in the runbook under "Future modes."
+Output is the same severity-tagged per-file findings shape as diff mode (see the **Output format** section below — the diff-mode template applies, with the per-file section anchoring to the bundle's `======== FILE: <path> ========` delimiters instead of a diff). The **architectural-summary output shape** (high-level "patterns / structure / smells" section preceding the per-file findings) is an explicit TODO; the trade-offs (hallucination risk on architectural takes, less actionable output, token-budget contention) are documented in the runbook under "Future modes."
 
 ## Output format
 
-Markdown, structured per the upstream `commands/code-review.toml` template:
+Markdown, structured per the upstream `commands/code-review.toml` template (diff modes) or the fork-added `commands/codebase-review.toml` template (`--codebase`). Both shapes use the same severity tags `CRITICAL | HIGH | MEDIUM | LOW`.
+
+**Diff modes (`--base`, `--pr`, `--staged`):**
 
 ```
-# Change summary: [one-sentence description]
+# Change summary: [one-sentence description of the change]
 
 ## File: path/to/file.py
 ### L<line>: [CRITICAL|HIGH|MEDIUM|LOW] One-sentence issue summary
@@ -150,7 +155,28 @@ Suggested change:
 ```
 ```
 
-When the diff is clean: `No issues found. Code looks clean and ready to merge.`
+Clean diff: `No issues found. Code looks clean and ready to merge.`
+
+**Whole-codebase mode (`--codebase`):**
+
+```
+# Codebase review summary: [one-sentence high-level take]
+[Optional 1-2 sentences of cross-file feedback for recurring patterns]
+
+## File: path/to/file.py
+### L<line>: [CRITICAL|HIGH|MEDIUM|LOW] One-sentence issue summary
+More detail about the issue.
+(Cross-file recurrences listed by file + line rather than repeating the full comment.)
+
+Suggested change:
+```
+    <code snippet showing the fix>
+```
+```
+
+Clean codebase: `No issues found. Code looks clean.`
+
+Line numbers in `--codebase` output are 1-indexed within each individual file (anchored to the `======== FILE: <path> ========` delimiters in the bundle), not against any synthetic line counter across the bundle.
 
 ## Operational runbook
 
