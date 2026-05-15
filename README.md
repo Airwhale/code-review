@@ -39,8 +39,8 @@ git checkout main && git merge upstream/main   # picks up upstream prompt change
 
 ```bash
 # One-time: clone and configure
-git clone https://github.com/Airwhale/code-review
-cd code-review
+git clone https://github.com/Airwhale/local-gemini-code-review
+cd local-gemini-code-review
 cp .env.example .env
 # edit .env: set OPENROUTER_API_KEY=... or GEMINI_API_KEY=... (or both)
 

@@ -9,7 +9,7 @@ The runner is a thin Python wrapper around the upstream `gemini-cli-extensions/c
 ## Setup
 
 ```
-Repository:    https://github.com/Airwhale/code-review
+Repository:    https://github.com/Airwhale/local-gemini-code-review
 Entry point:   review.py at the repo root
 Dependencies:  uv-managed -- first run installs them
 Config:        .env at the runner's repo root (NOT at the project being reviewed)

@@ -374,7 +374,7 @@ def main() -> None:
     if args.provider == "openrouter":
         referer = os.getenv(
             "OPENROUTER_HTTP_REFERER",
-            "https://github.com/Airwhale/code-review",
+            "https://github.com/Airwhale/local-gemini-code-review",
         )
         title = os.getenv("OPENROUTER_X_TITLE", "OpenRouter Code Review")
         output = call_openrouter(
