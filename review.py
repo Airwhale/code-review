@@ -551,7 +551,33 @@ def _resolve_model(args: argparse.Namespace) -> str:
     return model
 
 
+def _ensure_utf8_stdout() -> None:
+    """Reconfigure stdout/stderr to UTF-8 if they aren't already.
+
+    The model's output regularly contains Unicode characters (``->`` rendered
+    as ``\\u2192``, em-dashes, smart quotes, mermaid arrows) that cp1252 -- the
+    default stdout encoding on Windows -- cannot encode. Without this, the
+    very last line of main(), ``print(output)``, crashes with
+    ``UnicodeEncodeError`` after the model call has already succeeded and the
+    user has already paid for the tokens. Forcing UTF-8 with
+    ``errors="replace"`` keeps the runner robust on Windows without changing
+    anything on macOS/Linux (which are already UTF-8 by default).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                if (stream.encoding or "").lower() != "utf-8":
+                    stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                # Best-effort. Some shells / CI pipes wrap stdout in a way
+                # that doesn't expose ``reconfigure``; in those cases we
+                # fall through and accept a possible UnicodeEncodeError
+                # rather than hide a real configuration problem.
+                pass
+
+
 def main() -> None:
+    _ensure_utf8_stdout()
     # Load env from this script's directory so `.env` is configured once at
     # the runner location rather than in every project we review from.
     load_dotenv(ROOT / ".env")
