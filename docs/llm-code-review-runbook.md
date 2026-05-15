@@ -30,13 +30,13 @@ From any project directory:
 
 ```bash
 cd /path/to/your-project
-uv run --project /path/to/code-review /path/to/code-review/review.py --base origin/main
+uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-review/review.py --base origin/main
 ```
 
 Or from the runner directory against an external CWD:
 
 ```bash
-cd /path/to/code-review
+cd /path/to/local-gemini-code-review
 uv run review.py --pr 42
 ```
 
@@ -167,7 +167,7 @@ This is the artifact a human reviewer reads to understand what changed and why. 
 The command shape used most often during iterative work:
 
 ```bash
-uv run --project /path/to/code-review /path/to/code-review/review.py --base origin/main 2>&1 | tee /tmp/review.md
+uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-review/review.py --base origin/main 2>&1 | tee /tmp/review.md
 ```
 
 Tail the file in another shell, or pipe to `head -80` if you only want the top findings.

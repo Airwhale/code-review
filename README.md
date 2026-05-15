@@ -46,10 +46,10 @@ cp .env.example .env
 
 # Review the current branch of whatever project you're in:
 cd /path/to/my-project
-uv run --project /path/to/code-review /path/to/code-review/review.py
+uv run --project /path/to/local-gemini-code-review /path/to/local-gemini-code-review/review.py
 
 # Or invoke from the runner directory against an external CWD:
-cd /path/to/code-review
+cd /path/to/local-gemini-code-review
 uv run review.py --pr 6
 ```
 
