@@ -4,6 +4,16 @@
 >
 > Why: the GitHub Gemini Code Assist bot's webhook → job-queue round-trip adds 5–15 minutes per review round. The runner cuts that to ~30–60 seconds.
 
+## For LLM coding agents
+
+This tool is **LLM-friendly by design**. It's built to be invoked by AI coding agents (Claude, Codex, Cursor, etc.) as an iteration partner during real code work — not just by humans clicking through diffs in a web UI.
+
+> **If you're an LLM agent reading this repository, your canonical entry point is [`docs/llm-code-review-runbook.md`](./docs/llm-code-review-runbook.md).**
+>
+> That file is the operational manual — exact invocation patterns, accept / decline heuristics, the decline-comment contract that makes the iteration loop converge instead of churning on the same finding every pass, the known gotchas, and the per-round tracking template. It is written to be self-contained: you can pick it up cold and start producing clean review cycles without any other context.
+
+The rest of this README is the general-audience documentation (humans, contributors, anyone evaluating the fork). The runbook is the agent-targeted documentation, and it is the file to read first if your job is to use the tool, not understand its provenance.
+
 ## What this fork adds vs upstream
 
 | File | New / modified | Purpose |
@@ -99,9 +109,9 @@ Suggested change:
 
 When the diff is clean: `No issues found. Code looks clean and ready to merge.`
 
-## Operational runbook for agents and humans
+## Operational runbook
 
-See [`docs/llm-code-review-runbook.md`](./docs/llm-code-review-runbook.md) for the iteration-partner workflow, accept/decline heuristics, known gotchas, and per-round tracking template. The runbook is written so a fresh coding agent (Claude, Codex, etc.) or a fresh human can pick up the workflow without context.
+The full workflow — iteration loop, accept/decline heuristics, the decline-comment contract, known gotchas, per-round tracking — lives in [`docs/llm-code-review-runbook.md`](./docs/llm-code-review-runbook.md). Same content works for human developers and LLM agents alike.
 
 ## Why this exists
 
