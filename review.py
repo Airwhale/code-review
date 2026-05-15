@@ -249,6 +249,24 @@ def build_codebase_prompts(bundle: str) -> tuple[str, str]:
     return system_prompt, user_prompt
 
 
+def _format_size(n_bytes: int) -> str:
+    """Format a byte count in decimal-prefix units the way OS file managers do.
+
+    Returns ``"<n> B"`` below 1 KB, ``"<n> KB"`` (1000-based, integer) up to
+    1 MB, and ``"<n.x> MB"`` with one decimal above that. Decimal (1000)
+    rather than binary (1024) so the displayed value matches what users see
+    in their file manager and matches the decimal byte constants declared
+    in this module (``MAX_INDIVIDUAL_FILE_BYTES = 100_000`` reads as
+    "100 KB"). One source of truth for size display means the messages
+    stay sensible if the constants ever change scale.
+    """
+    if n_bytes >= 1_000_000:
+        return f"{n_bytes / 1_000_000:.1f} MB"
+    if n_bytes >= 1_000:
+        return f"{n_bytes // 1_000} KB"
+    return f"{n_bytes} B"
+
+
 def _run_git(args: list[str]) -> str:
     """Run a git command in the current working directory and return stdout.
     Surfaces non-zero exits with the command and stderr so the user sees why.
@@ -370,8 +388,8 @@ def gather_codebase_files(
             continue
         if size > MAX_INDIVIDUAL_FILE_BYTES:
             sys.stderr.write(
-                f"skip (>{MAX_INDIVIDUAL_FILE_BYTES // 1024} KB): "
-                f"{p.as_posix()} ({size:,} bytes)\n"
+                f"skip (>{_format_size(MAX_INDIVIDUAL_FILE_BYTES)}): "
+                f"{p.as_posix()} ({_format_size(size)})\n"
             )
             continue
         kept.append(p)
@@ -669,8 +687,10 @@ def main() -> None:
                 "or --exclude. Largest files in current selection:\n"
             )
             for path, size in sized[:10]:
+                # Right-justify the formatted size for visual alignment;
+                # 10 chars fits "999 KB", "99.9 MB", etc.
                 sys.stderr.write(
-                    f"  {size:>10,} bytes  {path.as_posix()}\n"
+                    f"  {_format_size(size):>10}  {path.as_posix()}\n"
                 )
             sys.exit(1)
         sys.stderr.write(
