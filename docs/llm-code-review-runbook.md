@@ -151,22 +151,47 @@ This is the central operational rule. Without it, the loop churns on the same fi
 
 ---
 
+## Error model
+
+The runner exits with **typed exit codes** so an LLM caller can react differently to each failure mode without parsing prose. The full table + decision tree lives in the README's "Error model (for LLM callers)" section; the short version:
+
+| Exit | Category | Quick action |
+|---|---|---|
+| 0 | OK | use stdout |
+| 2 | CONFIG | fix env / CLI flag; don't retry |
+| 10 | SAFETY_REFUSAL | retry with `--model claude` |
+| 11 | RATE_LIMIT | wait 60s; switch provider if persistent |
+| 12 | CONTEXT_OVERFLOW | narrow scope; don't retry as-is |
+| 13 | PROVIDER_HICCUP | retry; runner already auto-retried once |
+| 14 | TRANSPORT | exponential backoff; escalate after 3 |
+| 1 | UNKNOWN | read stderr; escalate |
+
+Stderr always starts with a stable line `ERROR: <CATEGORY> [exit <N>]` followed by free-form human-readable detail. An agent can grep that prefix to extract the category without parsing.
+
+The runner **auto-retries once** on `PROVIDER_HICCUP` and `TRANSPORT` before exiting; other categories surface immediately because retrying without changes doesn't help.
+
+## Safety context
+
+The runner prepends a short framing prefix to every review request, wrapped in `<CONTEXT_FOR_REVIEWER>...</CONTEXT_FOR_REVIEWER>`, to reduce false-positive content-filter refusals on diffs that contain words like `attack`, `sanctions`, `prompt injection`, `tampering`, `redaction` (common in security testing, AML compliance, policy enforcement code).
+
+Override per call with `--context "<your phrasing>"` or per environment with `$CODE_REVIEW_CONTEXT`. Disable with `--no-context` (rarely useful — the default already drops refusal rate significantly).
+
+See the README's "Safety context" section for the default phrasing.
+
 ## Known gotchas
 
-1. **Transient `None` output.** OpenRouter occasionally returns an empty completion (content filter, provider hiccup, rate-limit interstitial). The runner surfaces this as a literal `None`. Just rerun the same command — the second call has always worked in practice. Don't debug it.
+1. **Free-tier 429 on Gemini direct.** `--provider gemini --model gemini-2.5-pro` requires a paid Google AI Studio plan; the free tier returns HTTP 429 immediately (`RATE_LIMIT`, exit 11). Either use `--provider openrouter` (preferred) or `--model gemini-2.5-flash`.
 
-2. **Free-tier 429 on Gemini direct.** `--provider gemini --model gemini-2.5-pro` requires a paid Google AI Studio plan; the free tier returns HTTP 429 immediately. Either use `--provider openrouter` (preferred) or `--model gemini-2.5-flash`.
+2. **Two-dot vs three-dot diff.** `--base <ref>` uses two-dot (`git diff -U5 <ref>`) so working-tree changes show up. Three-dot (`<ref>...HEAD`) would show only committed changes and the reviewer would keep re-flagging the same issues. The two-dot semantics is intentional for the iteration workflow.
 
-3. **Two-dot vs three-dot diff.** `--base <ref>` uses two-dot (`git diff -U5 <ref>`) so working-tree changes show up. Three-dot (`<ref>...HEAD`) would show only committed changes and the reviewer would keep re-flagging the same issues. The two-dot semantics is intentional for the iteration workflow.
-
-4. **Diff size shapes round count.** Larger diffs surface more findings per round and take more rounds to converge. Rough observed shapes:
+3. **Diff size shapes round count.** Larger diffs surface more findings per round and take more rounds to converge. Rough observed shapes:
    - Small PR (~25K-char diff, single feature): 3–4 rounds
    - Medium PR (~50K chars): 4–6 rounds
    - Large PR (~300K chars): 8–12 rounds
 
-5. **`tee` to a file.** When output is large, pipe to `tee /tmp/review.md` so you can re-read findings without re-invoking the tool. Saves context budget on subsequent steps.
+4. **`tee` to a file.** When output is large, pipe to `tee /tmp/review.md` so you can re-read findings without re-invoking the tool. Saves context budget on subsequent steps.
 
-6. **Codebase-mode bundle cap.** `--codebase` enforces a 700 K-char (~175 K-token) pre-flight cap on the concatenated bundle. If you hit it, the runner exits with the 10 largest files in the current selection — use those to target `--exclude` flags. Common offenders: vendored fixture JSON, committed schema dumps, test data files.
+5. **Codebase-mode bundle cap.** `--codebase` enforces a 700 K-char (~175 K-token) pre-flight cap on the concatenated bundle. If you hit it, the runner exits with `CONTEXT_OVERFLOW` (exit 12) and lists the 10 largest files in the current selection — use those to target `--exclude` flags. Common offenders: vendored fixture JSON, committed schema dumps, test data files.
 
 ---
 

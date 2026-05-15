@@ -49,13 +49,170 @@ import fnmatch
 import os
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
+from typing import Callable, TypeVar
 
 import httpx
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).parent.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Error model
+# ---------------------------------------------------------------------------
+#
+# The runner is designed to be called by an LLM agent in a loop, not just by a
+# human at a shell. That means the exit code is a contract: an agent caller
+# needs to be able to react differently to "model refused" vs "rate limit"
+# vs "diff too big" vs "network down" without parsing prose. README's "Error
+# model" section is the public-facing version of this table; the constants
+# below are the in-code source of truth.
+#
+# Exit-code budget: 0 success, 1 catchall, 2 config, 10-19 reserved for typed
+# review errors. Codes 3-9 are conventionally Unix-shell-reserved; we skip
+# them.
+
+
+T = TypeVar("T")
+
+
+class ReviewError(Exception):
+    """Base class for typed runner errors.
+
+    Subclasses set ``exit_code``, ``category``, and ``suggested`` so the error
+    formatter in ``main`` can emit a structured stderr block an LLM caller
+    can pattern-match (``ERROR: <CATEGORY> [exit <N>]``).
+    """
+
+    exit_code: int = 1
+    category: str = "UNKNOWN"
+    suggested: str = "Read stderr for details; escalate if unclear."
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        detail: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.detail = detail
+        self.model = model
+        self.provider = provider
+
+
+class ConfigError(ReviewError):
+    """Missing API key, invalid CLI / env value, or other static-config bug."""
+
+    exit_code = 2
+    category = "CONFIG"
+    suggested = (
+        "Check the relevant env var or CLI flag (see the error message). "
+        "Do not retry without fixing the config -- retry will hit the same "
+        "error."
+    )
+
+
+class SafetyRefusal(ReviewError):
+    """Model refused on content-filter grounds.
+
+    Returned content was null with ``finish_reason`` indicating SAFETY,
+    ``content_filter``, or equivalent. Re-trying the same model with the
+    same prompt almost always reproduces the refusal; switch model first.
+    """
+
+    exit_code = 10
+    category = "SAFETY_REFUSAL"
+    suggested = (
+        "Retry with a different model: ``--model claude`` is the most "
+        "refusal-resistant on security / policy / adversarial-fixture code. "
+        "If still refused across models, the content may need human review."
+    )
+
+
+class RateLimit(ReviewError):
+    """Provider HTTP 429 -- request quota or RPS cap exceeded."""
+
+    exit_code = 11
+    category = "RATE_LIMIT"
+    suggested = (
+        "Wait 30-60 seconds and retry. If the limit is per-key per-day "
+        "(common on free tiers), switch ``--provider`` or ``--model`` to "
+        "one with separate quota."
+    )
+
+
+class ContextOverflow(ReviewError):
+    """Diff exceeded the model's input or output token budget."""
+
+    exit_code = 12
+    category = "CONTEXT_OVERFLOW"
+    suggested = (
+        "Narrow the diff scope: ``--include`` / ``--exclude`` in codebase "
+        "mode, or a smaller ``--base`` ref in diff mode. Do not retry "
+        "without reducing scope -- a second call with the same payload "
+        "will hit the same limit."
+    )
+
+
+class ProviderHiccup(ReviewError):
+    """Null content with no clear safety / length signal.
+
+    Empirically recovers ~always on a single retry. The runner auto-retries
+    once before raising this; if you see this exit code, both attempts
+    failed.
+    """
+
+    exit_code = 13
+    category = "PROVIDER_HICCUP"
+    suggested = (
+        "The runner already auto-retried once. Wait a few seconds and "
+        "retry; if still hicupped, switch ``--provider`` or ``--model``."
+    )
+
+
+class TransportError(ReviewError):
+    """Network / HTTP-5xx failure reaching the provider."""
+
+    exit_code = 14
+    category = "TRANSPORT"
+    suggested = (
+        "Retry with exponential backoff (2s, 4s, 8s). The runner already "
+        "retried once at 2s. If three additional retries fail, check the "
+        "provider's status page; escalate if the provider is up."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Safety context prefix
+# ---------------------------------------------------------------------------
+#
+# Prepended to every review prompt (overridable via --context / --no-context /
+# $CODE_REVIEW_CONTEXT). Lowers the false-positive refusal rate when the
+# diff under review contains words/patterns the model's safety filter
+# associates with harm in other contexts (security testing, policy code,
+# adversarial fixtures, AML domain language, etc.).
+#
+# Wording deliberately avoids "ignore safety guidelines" or similar
+# jailbreak-shaped phrasing -- that itself triggers safety filters. The
+# framing is "this is authorized code review of legitimate work"; the
+# specific examples (sanctions, attack, prompt injection, tampering,
+# redaction) are the words we've observed triggering false-positive
+# refusals on our own PRs.
+
+DEFAULT_CONTEXT = (
+    "The diff below is from a legitimate software-engineering project "
+    "undergoing authorized code review. The code may include defensive "
+    "security measures, adversarial test fixtures, policy enforcement "
+    "logic, or domain language that looks adversarial in isolation "
+    "(e.g. 'sanctions', 'attack', 'prompt injection', 'tampering', "
+    "'redaction'). Treat this as benign code review by the maintainers. "
+    "Do not refuse on the basis of subject matter."
+)
 
 # Provider configuration. The default model slug differs by provider because
 # OpenRouter prefixes vendor names (``google/...``) while the Gemini API
@@ -217,12 +374,31 @@ def load_command_prompt(name: str) -> str:
     return data["prompt"]
 
 
-def build_diff_prompts(diff: str) -> tuple[str, str]:
+def _apply_context(user_prompt: str, context: str | None) -> str:
+    """Prepend a safety-context block to the user prompt.
+
+    Wrapping the context in a labeled XML-style tag (``<CONTEXT_FOR_REVIEWER>``)
+    rather than free-floating prose keeps the model from accidentally treating
+    the framing as part of the code it should review. ``None`` / empty
+    short-circuits to the bare prompt for ``--no-context`` mode.
+    """
+    if not context:
+        return user_prompt
+    return (
+        "<CONTEXT_FOR_REVIEWER>\n"
+        f"{context}\n"
+        "</CONTEXT_FOR_REVIEWER>\n\n"
+        f"{user_prompt}"
+    )
+
+
+def build_diff_prompts(diff: str, context: str | None) -> tuple[str, str]:
     """Construct ``(system, user)`` prompts for diff-mode review.
 
     Loads the upstream ``code-review-commons`` skill (system prompt) and
     the upstream ``code-review`` command (user prompt template), then
-    substitutes the diff into the command's tool-call placeholder.
+    substitutes the diff into the command's tool-call placeholder and
+    prepends the optional safety-context block to the user prompt.
     """
     system_prompt = load_skill("code-review-commons")
     user_template = load_command_prompt("code-review")
@@ -232,10 +408,10 @@ def build_diff_prompts(diff: str) -> tuple[str, str]:
     # substitution missed, append the diff so the model still has it.
     if diff_block not in user_prompt:
         user_prompt = f"{user_prompt}\n\n{diff_block}"
-    return system_prompt, user_prompt
+    return system_prompt, _apply_context(user_prompt, context)
 
 
-def build_codebase_prompts(bundle: str) -> tuple[str, str]:
+def build_codebase_prompts(bundle: str, context: str | None) -> tuple[str, str]:
     """Construct ``(system, user)`` prompts for whole-codebase review.
 
     Uses the fork-added ``code-review-codebase`` skill and
@@ -262,7 +438,7 @@ def build_codebase_prompts(bundle: str) -> tuple[str, str]:
     else:
         # Defensive: same shape as ``build_diff_prompts`` defensive append.
         user_prompt = f"{user_template}\n\n{bundle_block}"
-    return system_prompt, user_prompt
+    return system_prompt, _apply_context(user_prompt, context)
 
 
 def _format_size(n_bytes: int) -> str:
@@ -457,6 +633,52 @@ def bundle_codebase(file_paths: list[Path]) -> str:
     return "\n\n".join(parts)
 
 
+def _classify_http_error(
+    status: int,
+    body: str,
+    *,
+    model: str,
+    provider: str,
+) -> ReviewError:
+    """Map a 4xx/5xx response to the right typed error.
+
+    Provider-side messages are inconsistent across vendors, so we pattern-
+    match on a small set of substrings the major providers use today. The
+    classification is best-effort -- a future provider could land a 4xx
+    that doesn't match any pattern, and that's fine: it falls through to
+    a generic ``ReviewError`` which surfaces as exit 1 with the response
+    body in ``detail`` so a caller can decide.
+    """
+    body_lower = body.lower()
+    if status == 429:
+        return RateLimit(
+            f"{provider} returned HTTP 429",
+            detail=body[:1000],
+            model=model,
+            provider=provider,
+        )
+    if status == 413 or "context_length" in body_lower or "too long" in body_lower or "exceeds the maximum" in body_lower:
+        return ContextOverflow(
+            f"{provider} returned HTTP {status} with context-length indication",
+            detail=body[:1000],
+            model=model,
+            provider=provider,
+        )
+    if 500 <= status < 600:
+        return TransportError(
+            f"{provider} returned HTTP {status} (provider-side failure)",
+            detail=body[:1000],
+            model=model,
+            provider=provider,
+        )
+    return ReviewError(
+        f"{provider} returned HTTP {status}",
+        detail=body[:1000],
+        model=model,
+        provider=provider,
+    )
+
+
 def call_openrouter(
     *,
     system_prompt: str,
@@ -471,6 +693,10 @@ def call_openrouter(
     """POST to OpenRouter's chat-completions endpoint and return the review
     markdown. Caller builds the prompts so this function stays mode-agnostic
     (diff review and codebase review share the same wire path).
+
+    Raises typed ``ReviewError`` subclasses on failure -- see the README's
+    "Error model" section for the contract. ``main`` catches and formats
+    them with the correct exit code.
     """
     payload = {
         "model": model,
@@ -496,23 +722,72 @@ def call_openrouter(
         "X-Title": title,
     }
 
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        response = client.post(OPENROUTER_URL, headers=headers, json=payload)
-        if response.status_code >= 400:
-            sys.stderr.write(
-                f"ERROR: OpenRouter returned HTTP {response.status_code}\n"
-                f"{response.text}\n"
-            )
-            sys.exit(1)
-        data = response.json()
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            response = client.post(OPENROUTER_URL, headers=headers, json=payload)
+    except httpx.RequestError as exc:
+        # Network-level failure: DNS, TCP, timeout, connection reset.
+        # Distinct from a provider 5xx (which is also a transport-class
+        # error but at least returned a response).
+        raise TransportError(
+            f"OpenRouter request failed before response: {exc}",
+            model=model,
+            provider="openrouter",
+        ) from exc
+
+    if response.status_code >= 400:
+        raise _classify_http_error(
+            response.status_code, response.text, model=model, provider="openrouter"
+        )
 
     try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
-        sys.stderr.write(
-            f"ERROR: unexpected OpenRouter response shape ({exc}):\n{data}\n"
+        data = response.json()
+    except ValueError as exc:
+        raise ProviderHiccup(
+            f"OpenRouter returned non-JSON response: {exc}",
+            detail=response.text[:1000],
+            model=model,
+            provider="openrouter",
+        ) from exc
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise ProviderHiccup(
+            "OpenRouter response had no choices",
+            detail=str(data)[:1000],
+            model=model,
+            provider="openrouter",
         )
-        sys.exit(1)
+    choice = choices[0]
+    finish_reason = (choice.get("finish_reason") or choice.get("native_finish_reason") or "").lower()
+    message = choice.get("message") or {}
+    content = message.get("content")
+
+    if content:
+        return content
+
+    # Null / empty content -- classify by finish_reason.
+    if finish_reason in ("safety", "content_filter", "content-filter", "blocked"):
+        raise SafetyRefusal(
+            f"Model refused with finish_reason={finish_reason!r}",
+            detail=str(data)[:1000],
+            model=model,
+            provider="openrouter",
+        )
+    if finish_reason in ("length", "max_tokens"):
+        raise ContextOverflow(
+            f"Hit max_tokens ({max_tokens}) before producing content "
+            f"(finish_reason={finish_reason!r})",
+            detail=str(data)[:1000],
+            model=model,
+            provider="openrouter",
+        )
+    raise ProviderHiccup(
+        f"Null content with finish_reason={finish_reason!r}",
+        detail=str(data)[:1000],
+        model=model,
+        provider="openrouter",
+    )
 
 
 def call_gemini(
@@ -526,7 +801,8 @@ def call_gemini(
 ) -> str:
     """POST to Google AI Studio's ``generateContent`` endpoint directly.
     Caller builds the prompts (same as ``call_openrouter``) so the wire
-    path is mode-agnostic.
+    path is mode-agnostic. Raises typed ``ReviewError`` subclasses; see
+    README "Error model".
     """
     payload = {
         "contents": [
@@ -551,34 +827,111 @@ def call_gemini(
     }
     url = GEMINI_URL_TEMPLATE.format(model=model)
 
-    with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-        response = client.post(url, headers=headers, json=payload)
-        if response.status_code >= 400:
-            sys.stderr.write(
-                f"ERROR: Gemini API returned HTTP {response.status_code}\n"
-                f"{response.text}\n"
-            )
-            sys.exit(1)
-        data = response.json()
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            response = client.post(url, headers=headers, json=payload)
+    except httpx.RequestError as exc:
+        raise TransportError(
+            f"Gemini request failed before response: {exc}",
+            model=model,
+            provider="gemini",
+        ) from exc
+
+    if response.status_code >= 400:
+        raise _classify_http_error(
+            response.status_code, response.text, model=model, provider="gemini"
+        )
 
     try:
-        # The generateContent response wraps the model output in
-        # candidates[0].content.parts[]; concatenate parts in case the
-        # model returned multiple text parts (rare for code review but
-        # documented as possible).
-        parts = data["candidates"][0]["content"]["parts"]
-        return "".join(part.get("text", "") for part in parts)
-    except (KeyError, IndexError) as exc:
-        sys.stderr.write(
-            f"ERROR: unexpected Gemini response shape ({exc}):\n{data}\n"
+        data = response.json()
+    except ValueError as exc:
+        raise ProviderHiccup(
+            f"Gemini API returned non-JSON response: {exc}",
+            detail=response.text[:1000],
+            model=model,
+            provider="gemini",
+        ) from exc
+
+    # Gemini can refuse at the prompt level (before generation) by
+    # returning ``promptFeedback.blockReason`` with no candidates.
+    prompt_feedback = data.get("promptFeedback") or {}
+    block_reason = prompt_feedback.get("blockReason")
+    if block_reason:
+        raise SafetyRefusal(
+            f"Gemini blocked prompt: blockReason={block_reason!r}",
+            detail=str(data)[:1000],
+            model=model,
+            provider="gemini",
         )
-        sys.exit(1)
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise ProviderHiccup(
+            "Gemini response had no candidates",
+            detail=str(data)[:1000],
+            model=model,
+            provider="gemini",
+        )
+    candidate = candidates[0]
+    finish_reason = (candidate.get("finishReason") or "").upper()
+    content_block = candidate.get("content") or {}
+    parts = content_block.get("parts") or []
+    text = "".join(part.get("text", "") for part in parts)
+
+    if text:
+        return text
+
+    # Null / empty content -- classify by finishReason.
+    if finish_reason == "SAFETY":
+        raise SafetyRefusal(
+            "Gemini refused output with finishReason=SAFETY",
+            detail=str(data)[:1000],
+            model=model,
+            provider="gemini",
+        )
+    if finish_reason == "MAX_TOKENS":
+        raise ContextOverflow(
+            f"Hit maxOutputTokens ({max_tokens}) before producing content "
+            "(finishReason=MAX_TOKENS)",
+            detail=str(data)[:1000],
+            model=model,
+            provider="gemini",
+        )
+    raise ProviderHiccup(
+        f"Empty content with finishReason={finish_reason!r}",
+        detail=str(data)[:1000],
+        model=model,
+        provider="gemini",
+    )
+
+
+def _retry_on_recoverable(call: Callable[[], T], *, label: str) -> T:
+    """Run ``call``; on ``ProviderHiccup`` or ``TransportError`` retry once.
+
+    Single retry only -- we deliberately do NOT compound on safety refusals
+    or rate limits (a second call to the same model with the same prompt
+    almost always reproduces those, and burns tokens) or context overflows
+    (the scope is wrong, not the call). Caller can chain its own retries
+    on the surviving exception if it wants exponential backoff.
+
+    ``label`` shows up in the retry-notice stderr line so a viewer scrolling
+    the log can tell which call retried.
+    """
+    try:
+        return call()
+    except (ProviderHiccup, TransportError) as exc:
+        sys.stderr.write(
+            f"[retry] {exc.category} on first attempt ({label}); "
+            "retrying once in 2s...\n"
+        )
+        time.sleep(2)
+        return call()
 
 
 def _resolve_model(args: argparse.Namespace) -> str:
     """Resolve the final model slug from CLI flag, env var, alias table,
-    or provider default. Errors out if an alias is used with the wrong
-    provider (the Gemini API direct path takes bare Gemini model names
+    or provider default. Raises ``ConfigError`` if an alias is used with the
+    wrong provider (the Gemini API direct path takes bare Gemini model names
     only -- a non-Gemini alias like ``claude`` is a category error there).
     """
     if args.model is not None:
@@ -590,18 +943,39 @@ def _resolve_model(args: argparse.Namespace) -> str:
 
     if model in MODEL_ALIASES:
         if args.provider != "openrouter":
-            sys.stderr.write(
-                f"ERROR: model alias `{model}` is only valid with "
-                f"--provider openrouter. The Gemini API direct path takes "
-                f"bare Gemini model names only (e.g. gemini-2.5-pro, "
-                f"gemini-2.5-flash). Either pass --provider openrouter to "
-                f"use this alias, or pass --model gemini-2.5-pro / "
-                f"--model gemini-2.5-flash for the direct path.\n"
+            raise ConfigError(
+                f"Model alias `{model}` is only valid with --provider openrouter. "
+                f"The Gemini API direct path takes bare Gemini model names only "
+                f"(e.g. gemini-2.5-pro, gemini-2.5-flash). Either pass "
+                f"--provider openrouter to use this alias, or pass "
+                f"--model gemini-2.5-pro / --model gemini-2.5-flash for the "
+                f"direct path."
             )
-            sys.exit(2)
         model = MODEL_ALIASES[model]
 
     return model
+
+
+def _print_error(err: ReviewError) -> None:
+    """Emit a structured stderr block for ``err``.
+
+    First line is the stable machine-parseable prefix:
+    ``ERROR: <CATEGORY> [exit <N>]``. Subsequent lines are human-readable
+    detail. LLM callers can grep for the first line to classify; humans can
+    read the body.
+    """
+    sys.stderr.write(f"ERROR: {err.category} [exit {err.exit_code}]\n")
+    sys.stderr.write(f"Reason: {err}\n")
+    if err.model:
+        sys.stderr.write(f"Model: {err.model}\n")
+    if err.provider:
+        sys.stderr.write(f"Provider: {err.provider}\n")
+    sys.stderr.write(f"Suggested: {err.suggested}\n")
+    if err.detail:
+        # Truncate to keep the stderr block scannable; full body is on
+        # ``err.detail`` if a caller wants programmatic access.
+        snippet = err.detail if len(err.detail) <= 400 else err.detail[:400] + "..."
+        sys.stderr.write(f"Detail: {snippet}\n")
 
 
 def _ensure_utf8_stdout() -> None:
@@ -742,7 +1116,35 @@ def main() -> None:
             "$CODE_REVIEW_MAX_TOKENS."
         ),
     )
+    parser.add_argument(
+        "--context",
+        default=None,
+        metavar="TEXT",
+        help=(
+            "Safety-context prefix prepended to every review prompt. "
+            "Reduces false-positive content-filter refusals on security "
+            "/ policy / adversarial-fixture code (the kind that contains "
+            "words like 'attack', 'sanctions', 'prompt injection' out of "
+            "context). Defaults to a generic 'authorized code review' "
+            "framing; override with this flag or $CODE_REVIEW_CONTEXT to "
+            "match your project's subject matter."
+        ),
+    )
+    parser.add_argument(
+        "--no-context",
+        action="store_true",
+        help=(
+            "Disable the safety-context prefix entirely. Useful only if "
+            "the default phrasing itself is what triggers a refusal "
+            "(rare). Mutually exclusive with --context."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.no_context and args.context is not None:
+        raise ConfigError(
+            "--no-context and --context are mutually exclusive. Pick one."
+        )
 
     model = _resolve_model(args)
 
@@ -753,12 +1155,11 @@ def main() -> None:
         env_temp = os.getenv("CODE_REVIEW_TEMPERATURE")
         try:
             temperature = float(env_temp) if env_temp is not None else DEFAULT_TEMPERATURE
-        except ValueError:
-            sys.stderr.write(
-                f"ERROR: $CODE_REVIEW_TEMPERATURE={env_temp!r} is not a "
-                "valid float. Unset it or pass --temperature explicitly.\n"
-            )
-            sys.exit(2)
+        except ValueError as exc:
+            raise ConfigError(
+                f"$CODE_REVIEW_TEMPERATURE={env_temp!r} is not a valid float. "
+                "Unset it or pass --temperature explicitly."
+            ) from exc
 
     # Resolve max_tokens with the same precedence.
     if args.max_tokens is not None:
@@ -767,34 +1168,43 @@ def main() -> None:
         env_max = os.getenv("CODE_REVIEW_MAX_TOKENS")
         try:
             max_tokens = int(env_max) if env_max is not None else DEFAULT_MAX_TOKENS
-        except ValueError:
-            sys.stderr.write(
-                f"ERROR: $CODE_REVIEW_MAX_TOKENS={env_max!r} is not a "
-                "valid integer. Unset it or pass --max-tokens explicitly.\n"
-            )
-            sys.exit(2)
+        except ValueError as exc:
+            raise ConfigError(
+                f"$CODE_REVIEW_MAX_TOKENS={env_max!r} is not a valid integer. "
+                "Unset it or pass --max-tokens explicitly."
+            ) from exc
+
+    # Resolve safety context: --no-context wins, then explicit --context,
+    # then env, then default. Empty string from env is treated as "use
+    # default" rather than "disabled" -- pass --no-context explicitly to
+    # disable, since an env value of "" is more likely a misconfig than
+    # intent.
+    if args.no_context:
+        context: str | None = None
+    elif args.context is not None:
+        context = args.context
+    else:
+        context = os.getenv("CODE_REVIEW_CONTEXT") or DEFAULT_CONTEXT
 
     # Resolve and validate the API key for the chosen provider before
     # touching git / GitHub so the user fails fast on configuration errors.
     if args.provider == "openrouter":
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
-            sys.stderr.write(
-                "ERROR: OPENROUTER_API_KEY not set. Copy .env.example to "
+            raise ConfigError(
+                "OPENROUTER_API_KEY not set. Copy .env.example to "
                 f".env at {ROOT} and fill in your key, or rerun with "
-                "--provider gemini if you only have a Gemini API key.\n"
+                "--provider gemini if you only have a Gemini API key."
             )
-            sys.exit(2)
     else:  # gemini
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            sys.stderr.write(
-                "ERROR: GEMINI_API_KEY not set. Copy .env.example to .env "
+            raise ConfigError(
+                "GEMINI_API_KEY not set. Copy .env.example to .env "
                 f"at {ROOT} and fill in your Google AI Studio key, or "
                 "rerun with --provider openrouter if you only have an "
-                "OpenRouter key.\n"
+                "OpenRouter key."
             )
-            sys.exit(2)
 
     # Build the payload for the chosen mode. ``--include`` / ``--exclude``
     # are codebase-mode-only -- warn if they show up alongside a diff
@@ -816,24 +1226,24 @@ def main() -> None:
                 key=lambda x: x[1],
                 reverse=True,
             )
-            sys.stderr.write(
-                f"ERROR: codebase bundle is {len(bundle):,} chars "
-                f"(limit {MAX_BUNDLE_CHARS:,}). Narrow with --include "
-                "or --exclude. Largest files in current selection:\n"
+            largest = "\n".join(
+                f"  {_format_size(size):>10}  {path.as_posix()}"
+                for path, size in sized[:10]
             )
-            for path, size in sized[:10]:
-                # Right-justify the formatted size for visual alignment;
-                # 10 chars fits "999 KB", "99.9 MB", etc.
-                sys.stderr.write(
-                    f"  {_format_size(size):>10}  {path.as_posix()}\n"
-                )
-            sys.exit(1)
+            raise ContextOverflow(
+                f"Codebase bundle is {len(bundle):,} chars "
+                f"(limit {MAX_BUNDLE_CHARS:,}). Narrow with --include "
+                "or --exclude.",
+                detail="Largest files in current selection:\n" + largest,
+                model=model,
+                provider=args.provider,
+            )
         sys.stderr.write(
             f"Reviewing {len(files)} file(s) ({len(bundle):,} chars) "
             f"with `{model}` via {args.provider} "
             f"(T={temperature}, max_tokens={max_tokens})...\n"
         )
-        system_prompt, user_prompt = build_codebase_prompts(bundle)
+        system_prompt, user_prompt = build_codebase_prompts(bundle, context)
     else:
         if args.include or args.exclude:
             sys.stderr.write(
@@ -851,37 +1261,59 @@ def main() -> None:
             f"Reviewing {len(diff):,}-char diff with `{model}` via "
             f"{args.provider} (T={temperature}, max_tokens={max_tokens})...\n"
         )
-        system_prompt, user_prompt = build_diff_prompts(diff)
+        system_prompt, user_prompt = build_diff_prompts(diff, context)
 
     # Wire-format dispatch. Both providers take the same (system, user)
-    # prompt pair; only the request shape differs.
+    # prompt pair; only the request shape differs. ``_retry_on_recoverable``
+    # wraps the call so a single provider hiccup or 5xx is absorbed
+    # automatically; other typed errors (safety, rate limit, context
+    # overflow, config) surface immediately for the caller to handle.
     if args.provider == "openrouter":
         referer = os.getenv(
             "OPENROUTER_HTTP_REFERER",
             "https://github.com/Airwhale/local-gemini-code-review",
         )
         title = os.getenv("OPENROUTER_X_TITLE", "OpenRouter Code Review")
-        output = call_openrouter(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            model=model,
-            api_key=api_key,
-            referer=referer,
-            title=title,
-            temperature=temperature,
-            max_tokens=max_tokens,
+        output = _retry_on_recoverable(
+            lambda: call_openrouter(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+                api_key=api_key,
+                referer=referer,
+                title=title,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
+            label="openrouter",
         )
     else:  # gemini
-        output = call_gemini(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            model=model,
-            api_key=api_key,
-            temperature=temperature,
-            max_tokens=max_tokens,
+        output = _retry_on_recoverable(
+            lambda: call_gemini(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+                api_key=api_key,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ),
+            label="gemini",
         )
     print(output)
 
 
+def _entrypoint() -> None:
+    """Top-level entry that maps typed errors to exit codes.
+
+    Keeping the try/except out of ``main`` itself means ``main`` can be
+    imported and unit-tested without the process-exit side effect.
+    """
+    try:
+        main()
+    except ReviewError as err:
+        _print_error(err)
+        sys.exit(err.exit_code)
+
+
 if __name__ == "__main__":
-    main()
+    _entrypoint()
