@@ -270,10 +270,26 @@ def _format_size(n_bytes: int) -> str:
 def _run_git(args: list[str]) -> str:
     """Run a git command in the current working directory and return stdout.
     Surfaces non-zero exits with the command and stderr so the user sees why.
+
+    ``encoding="utf-8"`` is explicit: without it, ``text=True`` decodes via
+    ``locale.getpreferredencoding(False)``, which on Windows is cp1252.
+    Source files containing non-ASCII characters (em-dashes, arrows, the
+    section sign) then come back to Python as mojibake (``â€"`` for ``--``,
+    ``â†'`` for ``->``, ``Â§`` for ``§``), the model sees the mojibake in
+    the diff, and the next review iteration flags "character encoding
+    artifacts in documentation files" -- a finding that doesn't exist in
+    the source, only in the runner's decoding step. ``errors="replace"``
+    is defensive in case git ever emits bytes that aren't valid UTF-8
+    (rare; usually a corrupted file).
     """
     try:
         result = subprocess.run(
-            args, capture_output=True, text=True, check=True
+            args,
+            capture_output=True,
+            text=True,
+            check=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.CalledProcessError as exc:
         sys.stderr.write(
@@ -304,11 +320,21 @@ def git_diff_local(base: str | None, staged: bool) -> str:
 
 
 def pr_diff(pr_number: int) -> str:
-    """Pull a PR's diff via `gh`. Requires `gh auth login` to have run."""
+    """Pull a PR's diff via `gh`. Requires `gh auth login` to have run.
+
+    Same Windows-locale concern as ``_run_git``: explicit
+    ``encoding="utf-8"`` keeps PR diffs containing em-dashes, arrows,
+    section signs, and other non-ASCII characters from being mangled
+    into cp1252 mojibake before the model sees them.
+    """
     try:
         result = subprocess.run(
             ["gh", "pr", "diff", str(pr_number), "--patch"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError:
         sys.stderr.write(
