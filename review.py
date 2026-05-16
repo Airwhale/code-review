@@ -615,6 +615,39 @@ def gather_codebase_files(
     return kept
 
 
+def _number_lines(content: str) -> str:
+    """Prefix each line with its 1-indexed line number, ``cat -n`` style.
+
+    LLMs cannot reliably count lines in long files. Without explicit
+    line numbers in the bundle, the model estimates line positions from
+    visual context and drifts by 50-150 lines on files >500 lines (and
+    5-15 lines on files >100). Prefixing every line with its number
+    turns "report a line number" from an arithmetic task (which
+    transformers cannot do reliably) into a transcription task (which
+    they do well).
+
+    Diff mode doesn't need this -- ``git diff -U5`` already embeds
+    ``@@ -L,N +L,N @@`` anchors plus context lines, so the model
+    transcribes from those. The whole-codebase bundle has no such
+    anchors, which is why this helper exists.
+
+    Format: ``<width>d: <line>``, right-aligned, minimum 6-char width
+    matching ``cat -n``. Trailing newline (if any) is preserved.
+    """
+    if not content:
+        return content
+    had_trailing_newline = content.endswith("\n")
+    lines = content.splitlines()
+    if not lines:
+        return content
+    width = max(6, len(str(len(lines))))
+    numbered = "\n".join(
+        f"{index:>{width}d}: {line}"
+        for index, line in enumerate(lines, start=1)
+    )
+    return numbered + "\n" if had_trailing_newline else numbered
+
+
 def bundle_codebase(file_paths: list[Path]) -> str:
     """Concatenate the given files into a single delimited bundle.
 
@@ -624,12 +657,17 @@ def bundle_codebase(file_paths: list[Path]) -> str:
     still reviewable. In practice this only triggers on files that
     should have been excluded by the asset-extension filter -- a true
     source file with a stray non-UTF8 byte is rare.
+
+    Each file's content is line-numbered via ``_number_lines`` before
+    bundling so the model can reference accurate line numbers in its
+    findings without having to count lines itself. See that helper for
+    the rationale.
     """
     parts: list[str] = []
     for path in file_paths:
         content = path.read_text(encoding="utf-8", errors="replace")
         delimiter = FILE_DELIMITER_TEMPLATE.format(path=path.as_posix())
-        parts.append(f"{delimiter}\n{content}")
+        parts.append(f"{delimiter}\n{_number_lines(content)}")
     return "\n\n".join(parts)
 
 

@@ -24,7 +24,7 @@ The user prompt contains the codebase as a series of files concatenated together
 ======== FILE: <path/to/file> ========
 ```
 
-The lines between two delimiters are the file's contents. Line numbers are **1-indexed within each file**, starting at the line immediately following the delimiter. When you reference a line, the line number is the position in that specific file's content, not a position in the overall bundle.
+The lines between two delimiters are the file's contents. **Each content line is prefixed with its 1-indexed line number followed by ``: ``** (e.g. ``   808: def _markdown_to_html(source: str) -> str:``). When you reference a line in your findings, use that prefix value verbatim as the line number — do not count lines yourself, just transcribe the prefix from the line you are commenting on. The line number is the position in that specific file's content (1-indexed at the line immediately following the delimiter), not a position in the overall bundle.
 
 ## Instructions
 

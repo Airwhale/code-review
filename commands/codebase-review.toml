@@ -1,7 +1,7 @@
 description = "Reviews the whole tracked codebase (or a filtered subset) as a single bundle"
 prompt = """
 <CONTEXT>
-    **Codebase**: see the bundle below. Each file is delimited by a line of the exact form `======== FILE: <path> ========`. Treat the content between two delimiters as the file's contents; line numbers are 1-indexed within each file, starting at the line immediately following the delimiter.
+    **Codebase**: see the bundle below. Each file is delimited by a line of the exact form `======== FILE: <path> ========`. Treat the content between two delimiters as the file's contents. **Each content line is prefixed with its 1-indexed line number followed by `: ` (e.g. `   808: def foo():`).** When you cite a line in your findings, transcribe the prefix value verbatim — do not count lines yourself. The line number is the position in that specific file's content (1-indexed at the line immediately following the delimiter), not a position in the overall bundle.
 
 <CODEBASE_BUNDLE_PLACEHOLDER>
 </CONTEXT>
