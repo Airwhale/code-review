@@ -488,11 +488,16 @@ def _run_git(args: list[str]) -> str:
             errors="replace",
         )
     except subprocess.CalledProcessError as exc:
-        sys.stderr.write(
-            f"ERROR: `{' '.join(args)}` failed (exit {exc.returncode})\n"
-            f"{exc.stderr.strip()}\n"
-        )
-        sys.exit(exc.returncode)
+        # Raise a typed error rather than ``sys.exit(exc.returncode)``
+        # so an LLM caller sees the documented ``ERROR: CONFIG [exit 2]``
+        # contract instead of a raw subprocess exit code (which collides
+        # with the UNKNOWN/1 bucket). Git failures are almost always a
+        # misconfigured ref / non-git directory / similar setup issue
+        # the caller has to fix before retry makes sense.
+        raise ConfigError(
+            f"`{' '.join(args)}` failed (exit {exc.returncode})",
+            detail=exc.stderr.strip(),
+        ) from exc
     return result.stdout
 
 
@@ -532,17 +537,18 @@ def pr_diff(pr_number: int) -> str:
             encoding="utf-8",
             errors="replace",
         )
-    except FileNotFoundError:
-        sys.stderr.write(
-            "ERROR: `gh` not found on PATH. Install GitHub CLI to use --pr.\n"
-        )
-        sys.exit(2)
+    except FileNotFoundError as exc:
+        # Same typed-error contract as ``_run_git``: callers see
+        # ``ERROR: CONFIG [exit 2]`` and know to install ``gh`` /
+        # adjust PATH before retrying.
+        raise ConfigError(
+            "`gh` not found on PATH. Install GitHub CLI to use --pr.",
+        ) from exc
     except subprocess.CalledProcessError as exc:
-        sys.stderr.write(
-            f"ERROR: `gh pr diff {pr_number}` failed (exit {exc.returncode})\n"
-            f"{exc.stderr.strip()}\n"
-        )
-        sys.exit(exc.returncode)
+        raise ConfigError(
+            f"`gh pr diff {pr_number}` failed (exit {exc.returncode})",
+            detail=exc.stderr.strip(),
+        ) from exc
     return result.stdout
 
 
@@ -713,7 +719,22 @@ def _classify_http_error(
             model=model,
             provider=provider,
         )
-    if status == 413 or "context_length" in body_lower or "too long" in body_lower or "exceeds the maximum" in body_lower:
+    # Match the family of provider phrases that signal context-length
+    # overflow, kept as a tuple so adding a new variant is a one-line
+    # edit. Each phrase was added based on an actual provider response
+    # observed in the wild or in published vendor docs; do not add
+    # speculative phrases without verifying a provider uses them, or
+    # you risk false-positive ContextOverflow classifications on
+    # unrelated 4xx errors.
+    CONTEXT_OVERFLOW_PHRASES = (
+        "context_length",
+        "too long",
+        "exceeds the maximum",
+        "token limit",
+        "input too large",
+        "payload size",
+    )
+    if status == 413 or any(phrase in body_lower for phrase in CONTEXT_OVERFLOW_PHRASES):
         return ContextOverflow(
             f"{provider} returned HTTP {status} with context-length indication",
             detail=body[:1000],
@@ -815,31 +836,41 @@ def call_openrouter(
             provider="openrouter",
         )
     choice = choices[0]
-    finish_reason = (choice.get("finish_reason") or choice.get("native_finish_reason") or "").lower()
+    # Inspect both ``finish_reason`` (OpenAI-standard normalized value)
+    # and ``native_finish_reason`` (OpenRouter's pass-through of the
+    # underlying provider's raw reason). They can disagree: a provider
+    # that safety-blocked a completion may surface as
+    # ``native_finish_reason="safety"`` while the normalized
+    # ``finish_reason="stop"`` -- preferring one over the other would
+    # miss that signal. We classify by the UNION of both fields, so a
+    # safety signal from either source wins over a generic "stop".
+    finish_reason = (choice.get("finish_reason") or "").lower()
+    native_finish_reason = (choice.get("native_finish_reason") or "").lower()
+    finish_reasons = {finish_reason, native_finish_reason} - {""}
     message = choice.get("message") or {}
     content = message.get("content")
 
     if content:
         return content
 
-    # Null / empty content -- classify by finish_reason.
-    if finish_reason in ("safety", "content_filter", "content-filter", "blocked"):
+    # Null / empty content -- classify by the union of finish_reasons.
+    if finish_reasons & {"safety", "content_filter", "content-filter", "blocked"}:
         raise SafetyRefusal(
-            f"Model refused with finish_reason={finish_reason!r}",
+            f"Model refused with finish_reasons={sorted(finish_reasons)!r}",
             detail=str(data)[:1000],
             model=model,
             provider="openrouter",
         )
-    if finish_reason in ("length", "max_tokens"):
+    if finish_reasons & {"length", "max_tokens"}:
         raise ContextOverflow(
             f"Hit max_tokens ({max_tokens}) before producing content "
-            f"(finish_reason={finish_reason!r})",
+            f"(finish_reasons={sorted(finish_reasons)!r})",
             detail=str(data)[:1000],
             model=model,
             provider="openrouter",
         )
     raise ProviderHiccup(
-        f"Null content with finish_reason={finish_reason!r}",
+        f"Null content with finish_reasons={sorted(finish_reasons)!r}",
         detail=str(data)[:1000],
         model=model,
         provider="openrouter",
@@ -1224,6 +1255,17 @@ def main() -> None:
                 f"$CODE_REVIEW_TEMPERATURE={env_temp!r} is not a valid float. "
                 "Unset it or pass --temperature explicitly."
             ) from exc
+    # Validate range here rather than letting the provider 4xx -- catches
+    # the misconfig as a typed CONFIG error (exit 2) the LLM caller can
+    # react to, instead of an opaque provider UNKNOWN. ``2.0`` is the
+    # common ceiling across OpenAI / Anthropic / Gemini; providers that
+    # accept higher will simply not see it, which is fine.
+    if not 0.0 <= temperature <= 2.0:
+        raise ConfigError(
+            f"temperature={temperature} is out of range [0.0, 2.0]. "
+            "Set --temperature or $CODE_REVIEW_TEMPERATURE to a value "
+            "in that range."
+        )
 
     # Resolve max_tokens with the same precedence.
     if args.max_tokens is not None:
@@ -1237,6 +1279,11 @@ def main() -> None:
                 f"$CODE_REVIEW_MAX_TOKENS={env_max!r} is not a valid integer. "
                 "Unset it or pass --max-tokens explicitly."
             ) from exc
+    if max_tokens <= 0:
+        raise ConfigError(
+            f"max_tokens={max_tokens} must be positive. "
+            "Set --max-tokens or $CODE_REVIEW_MAX_TOKENS to a positive integer."
+        )
 
     # Resolve safety context: --no-context wins, then explicit --context,
     # then env, then default. Empty string from env is treated as "use
@@ -1292,11 +1339,17 @@ def main() -> None:
             # and the alternative -- returning ``list[tuple[Path, int]]``
             # from a function that 99% of callers only need ``list[Path]``
             # from -- is a worse signature for a non-hot-path saving.
-            sized = sorted(
-                ((p, p.stat().st_size) for p in files),
-                key=lambda x: x[1],
-                reverse=True,
-            )
+            # Skip any file that disappeared between ``bundle_codebase``
+            # and now (narrow race window but possible on a busy CI box)
+            # so the error path doesn't itself crash with an
+            # ``OSError`` and bury the original ContextOverflow message.
+            def _safe_stat(p: Path) -> tuple[Path, int] | None:
+                try:
+                    return (p, p.stat().st_size)
+                except OSError:
+                    return None
+            sized_pairs = [pair for p in files if (pair := _safe_stat(p))]
+            sized = sorted(sized_pairs, key=lambda x: x[1], reverse=True)
             largest = "\n".join(
                 f"  {_format_size(size):>10}  {path.as_posix()}"
                 for path, size in sized[:10]
